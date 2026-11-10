@@ -1,0 +1,109 @@
+# Build self-contained Y-Proxy AppImage on Ubuntu 20.04 (glibc 2.31).
+# Export: docker build -f docker/Dockerfile.pack --target export -o type=local,dest=./dist-release .
+
+FROM ubuntu:20.04 AS builder
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    MAMBA_ROOT_PREFIX=/opt/micromamba
+
+# 1) HTTP mirror (no ca-certificates yet) → install certs
+# 2) Switch to HTTPS tuna
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.tuna.tsinghua.edu.cn/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && sed -i 's|http://mirrors.tuna.tsinghua.edu.cn/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      wget curl bzip2 tar xz-utils \
+      build-essential patchelf file desktop-file-utils \
+      libglib2.0-0 libgl1-mesa-glx libxkbcommon0 libdbus-1-3 \
+      libfontconfig1 libfreetype6 libx11-6 libxcb1 libxext6 libxrender1 \
+      libxi6 libsm6 libice6 libegl1 libopengl0 \
+      libxcb-xinerama0 libxcb-icccm4 libxcb-image0 \
+      libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-randr0 \
+      libxcb-xfixes0 libxkbcommon-x11-0 \
+ && (apt-get install -y --no-install-recommends libxcb-cursor0 || true) \
+ && rm -rf /var/lib/apt/lists/*
+
+# Python 3.11 via micromamba (PyQt6 needs >=3.10; focal system python is too old)
+RUN set -eux; \
+    wget -qO /tmp/micromamba.tar.bz2 https://micro.mamba.pm/api/micromamba/linux-64/latest \
+    || wget -qO /tmp/micromamba.tar.bz2 https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64.tar.bz2 \
+    || wget -qO /tmp/micromamba.tar.bz2 https://mirror.ghproxy.com/https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64.tar.bz2; \
+    mkdir -p /usr/local/bin /tmp/mm; \
+    tar -xjf /tmp/micromamba.tar.bz2 -C /tmp/mm; \
+    if [ -f /tmp/mm/bin/micromamba ]; then cp /tmp/mm/bin/micromamba /usr/local/bin/micromamba; \
+    elif [ -f /tmp/mm/micromamba ]; then cp /tmp/mm/micromamba /usr/local/bin/micromamba; \
+    else find /tmp/mm -name micromamba -type f -exec cp {} /usr/local/bin/micromamba \; ; fi; \
+    chmod +x /usr/local/bin/micromamba; \
+    micromamba create -y -p /opt/venv -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge python=3.11 pip; \
+    rm -rf /tmp/micromamba.tar.bz2 /tmp/mm
+
+ENV PATH=/opt/venv/bin:$PATH \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+WORKDIR /src
+COPY requirements.txt run_app.py lan_relay.py ./
+COPY app ./app
+COPY packaging ./packaging
+
+# Prefer official PyPI binary wheels for PyQt6 (tuna often falls back to sdist → needs qmake).
+RUN pip install -U pip wheel \
+ && pip install --only-binary=:all: \
+      -i https://pypi.org/simple \
+      'PyQt6>=6.5,<6.13' 'PyQt6-Qt6>=6.5,<6.13' \
+ && pip install -i https://pypi.org/simple \
+      'PyQt6-Fluent-Widgets>=1.7.0' pyinstaller \
+ && python packaging/make_icon.py \
+ && python -c "import PyQt6, qfluentwidgets; print('deps ok', PyQt6.QtCore.PYQT_VERSION_STR)"
+
+RUN pyinstaller --noconfirm --clean packaging/y_proxy_linux.spec
+
+RUN set -eux; \
+    STAMP=$(date +%Y%m%d-%H%M%S); \
+    mkdir -p /out/linux-x64; \
+    tar -C /src/dist -czf "/out/linux-x64/Y-Proxy-${STAMP}-linux-x64.tar.gz" Y-Proxy; \
+    APPDIR=/out/AppDir; \
+    mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"; \
+    cp -a /src/dist/Y-Proxy/. "$APPDIR/usr/bin/"; \
+    printf '%s\n' \
+      '[Desktop Entry]' \
+      'Type=Application' \
+      'Name=Y-Proxy' \
+      'Comment=LAN proxy share' \
+      'Exec=Y-Proxy' \
+      'Icon=y-proxy' \
+      'Categories=Network;' \
+      'Terminal=false' \
+      > "$APPDIR/usr/share/applications/y-proxy.desktop"; \
+    cp /src/packaging/y-proxy.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/y-proxy.png"; \
+    cp /src/packaging/y-proxy.png "$APPDIR/y-proxy.png"; \
+    cp "$APPDIR/usr/share/applications/y-proxy.desktop" "$APPDIR/y-proxy.desktop"; \
+    printf '%s\n' '#!/bin/bash' 'HERE="$(dirname "$(readlink -f "$0")")"' 'export APPDIR="$HERE"' 'cd "$HERE/usr/bin"' 'exec "$HERE/usr/bin/Y-Proxy" "$@"' > "$APPDIR/AppRun"; \
+    chmod +x "$APPDIR/AppRun" "$APPDIR/usr/bin/Y-Proxy"; \
+    if wget -q -O /tmp/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+       || wget -q -O /tmp/appimagetool https://mirror.ghproxy.com/https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage; then \
+      chmod +x /tmp/appimagetool; \
+      cd /out; \
+      ARCH=x86_64 /tmp/appimagetool --appimage-extract-and-run "$APPDIR" "Y-Proxy-${STAMP}-x86_64.AppImage"; \
+      mv "Y-Proxy-${STAMP}-x86_64.AppImage" /out/linux-x64/; \
+    else \
+      echo 'appimagetool download failed; shipping tar.gz only' > /out/linux-x64/APPIMAGE-MISSING.txt; \
+    fi; \
+    printf '%s\n' \
+      "Y-Proxy Linux x86_64 (glibc 2.31 / Ubuntu 20.04+)" \
+      "" \
+      "AppImage:" \
+      "  chmod +x Y-Proxy-*-x86_64.AppImage && ./Y-Proxy-*-x86_64.AppImage" \
+      "" \
+      "Fallback tar.gz:" \
+      "  tar xzf Y-Proxy-*-linux-x64.tar.gz && ./Y-Proxy/Y-Proxy" \
+      > /out/linux-x64/README.txt; \
+    ls -lh /out/linux-x64; \
+    rm -rf /out/AppDir
+
+FROM scratch AS export
+COPY --from=builder /out/linux-x64/ /linux-x64/

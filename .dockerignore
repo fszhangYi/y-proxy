@@ -1,0 +1,13 @@
+build/
+dist/
+dist-release/
+**/__pycache__/
+**/*.pyc
+.git/
+*.md
+*.AppImage
+packvenv/
+build/packvenv/
+build/cpython/
+build/*.exe
+build/*.log

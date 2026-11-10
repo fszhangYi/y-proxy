@@ -1,0 +1,12 @@
+build/
+dist/
+dist-release/
+__pycache__/
+*.py[cod]
+*.spec.bak
+.packaging-cache/
+*.AppImage
+*.tar.gz
+*.exe
+.venv/
+packvenv/
